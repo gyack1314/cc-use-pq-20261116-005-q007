@@ -35,11 +35,12 @@ class RegistryTests(LedgerCase):
                                           "license": "L", "allowed_indicators": ["missing"]})
         self.assertEqual(len(self.service.registry.list_sources()), 2)
 
-    def test_unit_rule_is_immutable(self):
+    def test_unit_rule_conflict_overlaps_existing(self):
         self.service.register_unit({"indicator": "co2_ppm", "source_unit": "ppb", "factor": "0.001"})
-        with self.assertRaisesRegex(ContractError, "rule_immutable"):
+        with self.assertRaisesRegex(ContractError, "rule_overlap"):
             self.service.register_unit({"indicator": "co2_ppm", "source_unit": "ppb", "factor": "0.002"})
-        self.assertEqual(self.service.registry.conversion(self.service.registry.indicator("co2_ppm"), "ppb").factor, "0.001")
+        indicator = self.service.registry.indicator("co2_ppm")
+        self.assertEqual(self.service.registry.conversion(indicator, "ppb", "2026-01").factor, "0.001")
 
     def test_canonical_conversion_must_be_identity(self):
         with self.assertRaisesRegex(ContractError, "canonical_conversion"):

@@ -8,7 +8,7 @@ from typing import Any, Iterator
 import json
 import sqlite3
 
-from .registry import ContractError, UnitRule
+from .registry import ContractError, UnitRule, intervals_overlap
 from .intake import canonical_bytes
 
 
@@ -18,7 +18,9 @@ CREATE TABLE IF NOT EXISTS indicators (key TEXT PRIMARY KEY, contract TEXT NOT N
 CREATE TABLE IF NOT EXISTS sources (key TEXT PRIMARY KEY, contract TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS unit_rules (
     indicator TEXT NOT NULL, source_unit TEXT NOT NULL, factor TEXT NOT NULL, offset TEXT NOT NULL,
-    PRIMARY KEY(indicator, source_unit), FOREIGN KEY(indicator) REFERENCES indicators(key));
+    valid_from TEXT NOT NULL, valid_to TEXT NOT NULL,
+    PRIMARY KEY(indicator, source_unit, valid_from, valid_to),
+    FOREIGN KEY(indicator) REFERENCES indicators(key));
 CREATE TABLE IF NOT EXISTS batches (
     id INTEGER PRIMARY KEY, source TEXT NOT NULL, external_id TEXT NOT NULL, revision INTEGER NOT NULL,
     payload_hash TEXT NOT NULL, status TEXT NOT NULL, row_count INTEGER NOT NULL,
@@ -29,7 +31,7 @@ CREATE INDEX IF NOT EXISTS batches_lookup ON batches(source, external_id, revisi
 CREATE TABLE IF NOT EXISTS measurements (
     batch_id INTEGER NOT NULL, line INTEGER NOT NULL, indicator TEXT NOT NULL, period TEXT NOT NULL,
     value TEXT NOT NULL, unit TEXT NOT NULL, raw_value TEXT NOT NULL, raw_unit TEXT NOT NULL,
-    factor TEXT NOT NULL, offset TEXT NOT NULL,
+    factor TEXT NOT NULL, offset TEXT NOT NULL, valid_from TEXT, valid_to TEXT,
     PRIMARY KEY(batch_id, line), FOREIGN KEY(batch_id) REFERENCES batches(id),
     FOREIGN KEY(indicator) REFERENCES indicators(key));
 CREATE INDEX IF NOT EXISTS measurements_series ON measurements(indicator, period);
@@ -116,18 +118,25 @@ class LedgerStore:
 
     def register_unit(self, rule: UnitRule) -> None:
         with self.transaction():
-            old = self.get_unit(rule.indicator, rule.source_unit)
-            if old is not None and old != rule:
-                raise ContractError("rule_immutable", "unit rule already differs")
-            if old is None:
-                self.connection.execute("INSERT INTO unit_rules VALUES(?,?,?,?)",
-                                        (rule.indicator, rule.source_unit, rule.factor, rule.offset))
-                self.event("register_unit", rule.indicator, asdict(rule))
+            for old in self.get_units(rule.indicator, rule.source_unit):
+                if old == rule:
+                    return
+                if intervals_overlap(old, rule):
+                    raise ContractError(
+                        "rule_overlap",
+                        f"{rule.indicator}: {rule.source_unit} interval {rule.span()} "
+                        f"overlaps registered {old.span()}")
+            self.connection.execute("INSERT INTO unit_rules VALUES(?,?,?,?,?,?)",
+                                    (rule.indicator, rule.source_unit, rule.factor, rule.offset,
+                                     rule.valid_from or "", rule.valid_to or ""))
+            self.event("register_unit", rule.indicator, asdict(rule))
 
-    def get_unit(self, indicator: str, source_unit: str) -> UnitRule | None:
-        row = self.connection.execute("SELECT * FROM unit_rules WHERE indicator=? AND source_unit=?",
-                                      (indicator, source_unit)).fetchone()
-        return UnitRule(*row) if row else None
+    def get_units(self, indicator: str, source_unit: str) -> list[UnitRule]:
+        rows = self.connection.execute(
+            "SELECT * FROM unit_rules WHERE indicator=? AND source_unit=? "
+            "ORDER BY valid_from, valid_to", (indicator, source_unit)).fetchall()
+        return [UnitRule(row["indicator"], row["source_unit"], row["factor"], row["offset"],
+                         row["valid_from"] or None, row["valid_to"] or None) for row in rows]
 
     def latest_batch(self, source: str, external_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT * FROM batches WHERE source=? AND external_id=? ORDER BY revision DESC LIMIT 1",
@@ -168,9 +177,10 @@ class LedgerStore:
                  canonical_bytes([item.document() for item in assessment.findings]).decode(), utc_now()))
             batch_id = cursor.lastrowid
             self.connection.executemany(
-                "INSERT INTO measurements VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO measurements VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 [(batch_id, item.line, item.indicator, item.period, item.value, item.unit,
-                  item.raw_value, item.raw_unit, item.rule_factor, item.rule_offset)
+                  item.raw_value, item.raw_unit, item.rule_factor, item.rule_offset,
+                  item.rule_valid_from, item.rule_valid_to)
                  for item in measurements])
             self.event("ingest", f"batch:{batch_id}", {"status": assessment.status,
                        "revision": revision, "payload_hash": envelope.payload_hash})

@@ -29,11 +29,19 @@ class ReplayInspector:
         comparison = []
         for item in measurements:
             old = next((row for row in expected if row["line"] == item.line), None)
+            replayed_rule = {"factor": item.rule_factor, "offset": item.rule_offset,
+                             "valid_from": item.rule_valid_from, "valid_to": item.rule_valid_to}
+            stored_rule = None
+            if old is not None:
+                stored_rule = {"factor": old["factor"], "offset": old["offset"],
+                               "valid_from": old["valid_from"], "valid_to": old["valid_to"]}
             comparison.append({"line": item.line, "matches": old is not None and
                                old["indicator"] == item.indicator and old["period"] == item.period and
-                               old["value"] == item.value and old["unit"] == item.unit,
+                               old["value"] == item.value and old["unit"] == item.unit and
+                               stored_rule == replayed_rule,
                                "stored_value": old["value"] if old else None,
-                               "replayed_value": item.value})
+                               "replayed_value": item.value,
+                               "stored_rule": stored_rule, "replayed_rule": replayed_rule})
         return {"batch_id": batch_id, "identity_match": identity, "payload_hash_match": bytes_match,
                 "stored_rows": len(expected), "replayed_rows": len(measurements),
                 "rejected_rows": rejected, "row_comparison": comparison,

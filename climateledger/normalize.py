@@ -25,6 +25,8 @@ class Measurement:
     line: int
     rule_factor: str
     rule_offset: str
+    rule_valid_from: str | None
+    rule_valid_to: str | None
 
     def document(self) -> dict[str, Any]:
         return asdict(self)
@@ -79,7 +81,7 @@ class Normalizer:
         raw_unit = row.get("unit")
         if not isinstance(raw_unit, str) or not raw_unit.strip():
             raise ContractError("unit_type", "unit must be nonempty text")
-        rule = self.registry.conversion(indicator, raw_unit)
+        rule = self.registry.conversion(indicator, raw_unit, period)
         raw = precise(row.get("value"), "value")
         converted = rule.convert(raw)
         value = canonical_decimal(converted, indicator.precision)
@@ -87,7 +89,8 @@ class Normalizer:
         if type(line) is not int or line < 1:
             raise ContractError("line_number", "line must be a positive integer")
         return Measurement(source.key, indicator.key, period, value, indicator.canonical_unit,
-                           str(raw), raw_unit, line, rule.factor, rule.offset)
+                           str(raw), raw_unit, line, rule.factor, rule.offset,
+                           rule.valid_from, rule.valid_to)
 
     def batch(self, source: Source, rows: tuple[dict[str, Any], ...]) -> tuple[list[Measurement], list[dict[str, Any]]]:
         accepted = []

@@ -119,11 +119,14 @@ class UnitRule:
     source_unit: str
     factor: str
     offset: str
+    valid_from: str | None
+    valid_to: str | None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "UnitRule":
         if not isinstance(value, dict):
             raise ContractError("unit_rule_shape", "unit rule must be an object")
+        from .normalize import MONTH, YEAR  # local import avoids a module cycle
         indicator = identifier(value.get("indicator"), "indicator")
         source_unit = value.get("source_unit")
         if not isinstance(source_unit, str) or not source_unit.strip() or len(source_unit) > 32:
@@ -132,10 +135,47 @@ class UnitRule:
         offset = precise(value.get("offset", 0), "offset")
         if factor == 0:
             raise ContractError("zero_factor", "conversion factor cannot be zero")
-        return cls(indicator, source_unit.strip(), str(factor), str(offset))
+        bounds = []
+        for label in ("valid_from", "valid_to"):
+            raw = value.get(label)
+            if raw is None:
+                bounds.append(None)
+                continue
+            if not isinstance(raw, str) or not (MONTH.fullmatch(raw) or YEAR.fullmatch(raw)):
+                raise ContractError("rule_interval", f"{label} must be a period like 2026-01 or 2026")
+            bounds.append(raw)
+        valid_from, valid_to = bounds
+        if valid_from is not None and valid_to is not None:
+            monthly = [bool(MONTH.fullmatch(bound)) for bound in (valid_from, valid_to)]
+            if monthly[0] != monthly[1]:
+                raise ContractError("rule_interval", "valid_from and valid_to must share one cadence")
+            if valid_from >= valid_to:
+                raise ContractError("rule_interval", "valid_from must precede valid_to")
+        return cls(indicator, source_unit.strip(), str(factor), str(offset), valid_from, valid_to)
 
     def convert(self, raw: Any) -> Decimal:
         return precise(raw, "value") * Decimal(self.factor) + Decimal(self.offset)
+
+    def covers(self, period: str) -> bool:
+        if self.valid_from is not None and period < self.valid_from:
+            return False
+        if self.valid_to is not None and period >= self.valid_to:
+            return False
+        return True
+
+    def span(self) -> str:
+        return (f"[{self.valid_from or '*'}, {self.valid_to or '*'}) "
+                f"factor={self.factor} offset={self.offset}")
+
+
+def intervals_overlap(first: UnitRule, second: UnitRule) -> bool:
+    if (first.valid_to is not None and second.valid_from is not None
+            and second.valid_from >= first.valid_to):
+        return False
+    if (second.valid_to is not None and first.valid_from is not None
+            and first.valid_from >= second.valid_to):
+        return False
+    return True
 
 
 class Registry:
@@ -155,8 +195,19 @@ class Registry:
         return source
 
     def register_unit(self, value: dict[str, Any]) -> UnitRule:
+        from .normalize import normalize_period  # local import avoids a module cycle
         rule = UnitRule.from_dict(value)
         indicator = self.indicator(rule.indicator)
+        for bound in (rule.valid_from, rule.valid_to):
+            if bound is None:
+                continue
+            try:
+                normalize_period(bound, indicator.cadence)
+            except ContractError:
+                raise ContractError(
+                    "rule_interval",
+                    f"interval bound {bound!r} does not match {indicator.key} cadence "
+                    f"{indicator.cadence}") from None
         if rule.source_unit == indicator.canonical_unit and (rule.factor != "1" or rule.offset != "0"):
             raise ContractError("canonical_conversion", "canonical unit cannot have nonidentity conversion")
         self.store.register_unit(rule)
@@ -176,13 +227,25 @@ class Registry:
             raise ContractError("unknown_source", f"source {key} is not registered")
         return Source.from_dict(json.loads(value))
 
-    def conversion(self, indicator: Indicator, source_unit: str) -> UnitRule:
+    def conversion(self, indicator: Indicator, source_unit: str, period: str) -> UnitRule:
         if source_unit == indicator.canonical_unit:
-            return UnitRule(indicator.key, source_unit, "1", "0")
-        rule = self.store.get_unit(indicator.key, source_unit)
-        if rule is None:
+            return UnitRule(indicator.key, source_unit, "1", "0", None, None)
+        rules = self.store.get_units(indicator.key, source_unit)
+        if not rules:
             raise ContractError("unknown_unit", f"no conversion for {indicator.key}: {source_unit}")
-        return rule
+        matches = [rule for rule in rules if rule.covers(period)]
+        if not matches:
+            intervals = "; ".join(rule.span() for rule in rules)
+            raise ContractError(
+                "unit_rule_gap",
+                f"no conversion for {indicator.key}: {source_unit} at period {period}; "
+                f"registered intervals: {intervals}")
+        if len(matches) > 1:
+            spans = "; ".join(rule.span() for rule in matches)
+            raise ContractError(
+                "rule_overlap",
+                f"multiple rules cover {indicator.key}: {source_unit} at period {period}: {spans}")
+        return matches[0]
 
     def require_scope(self, source: Source, indicator: Indicator) -> None:
         if not source.active:

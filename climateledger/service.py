@@ -53,7 +53,8 @@ class LedgerService:
     def register_unit(self, contract: dict[str, Any]) -> dict[str, Any]:
         rule = self.registry.register_unit(contract)
         return {"indicator": rule.indicator, "source_unit": rule.source_unit,
-                "factor": rule.factor, "offset": rule.offset}
+                "factor": rule.factor, "offset": rule.offset,
+                "valid_from": rule.valid_from, "valid_to": rule.valid_to}
 
     def ingest(self, manifest_path: str | Path) -> dict[str, Any]:
         envelope = load_batch(manifest_path)
